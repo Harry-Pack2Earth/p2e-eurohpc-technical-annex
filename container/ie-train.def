@@ -1,0 +1,89 @@
+Bootstrap: docker
+From: docker.io/axolotlai/axolotl:main-20260817-py3.12-cu130-2.11.0
+
+# ie-train.sif — the LLM LoRA-SFT image for the in-house extraction model (materials-IE v2).
+# Separate from p2e-formulations.sif (the modelling lane's sklearn/torch image).
+#
+# WHY THIS BASE (decided 2026-08-17, after two failed bases):
+#   Qwen3.5-27B released Feb 2026 → needs transformers>=5.2 (Qwen3_5Config) → a recent
+#   axolotl → triton>=3.4 → torch>=2.8. The dependency chain is bleeding-edge and the two
+#   earlier bases both failed on a link in it:
+#     - nvcr.io/nvidia/pytorch:25.01-py3 → torch 2.6 / numpy 1.26 too old for any axolotl.
+#     - axolotlai/axolotl ...cu126-2.7.1 → torch 2.7.1 pins triton==3.3.1, but axolotl 0.16.1
+#       needs triton>=3.4 → ResolutionImpossible.
+#   The official axolotl CURRENT image ships one fully-coherent, vendor-matched stack —
+#   torch 2.11 + CUDA 13.0 + a matched flash-attn wheel + deepspeed + the latest axolotl +
+#   a Qwen3.5-capable transformers. So this def is a DROP-IN: we add NOTHING to the ML stack
+#   (installing torch/axolotl/transformers/flash-attn on top is exactly what broke the two
+#   previous bases). Pinned dated tag — never :latest.
+#
+# MN5 CUDA COMPATIBILITY:
+#   ACC-node driver = 595.71.05 (measured from a real GPU job, modelling lane). r580 already
+#   advertises CUDA 13.0 and 595 is newer, so the driver supports CUDA >= 13.0 → the cu130
+#   runtime runs under `singularity exec --nv`. This is INFERRED from the driver version, not
+#   yet proven — the mandatory acc_debug smoke job is the gate, and the sbatch echoes a bare
+#   `nvidia-smi` so the full CUDA header lands on the record on that first run.
+#
+# UNVERIFIED UNTIL THE MN5 SMOKE:
+#   Built linux/amd64 on an Apple-Silicon host via colima + Rosetta. x86_64 numeric libraries
+#   SIGILL under emulation at import, so the %post probe below is informational and non-fatal.
+#   The image is NOT proven until one acc_debug job loads Qwen3.5 + FA2 on an H100 (~11s if
+#   the image is broken). See scripts/ie/README-ie-train.md.
+
+%files
+    pyproject.toml /opt/p2e/pyproject.toml
+    src            /opt/p2e/src
+    config         /opt/p2e/config
+    scripts        /opt/p2e/scripts
+
+%post
+    # EXEC-PERMS FIX (MN5 runs the container as the invoking NON-root user, uid 54409):
+    # the axolotl venv's `python` symlinks to a uv-managed base interpreter kept under a
+    # 0700 root path, so a normal user gets "exec: .../python: Permission denied" (the venv
+    # SCRIPTS are already world-rwx; only the base interpreter is locked). Make the venv and
+    # the likely base-interpreter locations world-readable/executable. Pure chmod — runs fine
+    # under Rosetta (no Python), and a+rX only ADDS perms (X = execute on dirs + already-exec
+    # files), never removes. This is what the first smoke (exit 126, 13s) caught.
+    chmod -R a+rX /workspace /root /opt /usr/local 2>/dev/null || true
+    PYHOME="$(awk -F'=' '/^home/{gsub(/[[:space:]]/,"",$2); print $2}' /workspace/axolotl-venv/pyvenv.cfg 2>/dev/null || true)"
+    [ -n "${PYHOME}" ] && chmod -R a+rX "${PYHOME}" 2>/dev/null || true
+
+    # DROP-IN: do NOT touch torch / axolotl / transformers / flash-attn / deepspeed — the base
+    # image already has them, mutually matched. Install ONLY our repo, and WITHOUT deps: the
+    # only thing that runs INSIDE the SIF from our code is scripts/ie/predict.py, whose imports
+    # are self-contained (torch/transformers/peft — already present). Non-fatal by design.
+    python -m pip install --no-cache-dir --no-deps /opt/p2e 2>&1 || \
+        echo "WARN: p2e --no-deps install skipped (non-fatal; predict.py runs as a script, needs no install)"
+
+    # SPEED — Qwen3.5 GatedDeltaNet FAST-PATH kernels. The base image lacks them, so 48/64 linear-
+    # attention layers fall back to pure-torch at inference (predict logs "The fast path is not
+    # available … Falling back to torch implementation"), ~2-5x slower. These are the model's
+    # SANCTIONED kernels (the error links them), and they are ADDITIVE — no torch/transformers/
+    # axolotl change, so they don't disturb the vendor-matched stack. fla = Triton (no compile);
+    # causal-conv1d = a CUDA extension compiled against the image's torch 2.11 / cu130 (needs the
+    # build to run on a CUDA host — NOT the arm Mac). Both wrapped NON-FATAL: a failed build just
+    # keeps the current pure-torch fallback, never breaks the SIF. The MN5 smoke is the real gate:
+    # confirm `import fla` + no "fast path not available" line + the ex/min jumps.
+    python -m pip install --no-cache-dir flash-linear-attention 2>&1 || echo "WARN: fla install failed — pure-torch fallback kept"
+    python -m pip install --no-cache-dir causal-conv1d 2>&1 || echo "WARN: causal-conv1d build failed — pure-torch fallback kept"
+
+    # Informational import probe — SIGILLs harmlessly under Rosetta; the REAL gate is the MN5
+    # smoke. Wrapped so it can never fail the build.
+    python - <<'PY' 2>&1 || echo "WARN: import probe failed/SIGILL under ARM emulation — expected; verify on MN5"
+import torch, transformers, peft, deepspeed
+ax = getattr(__import__("axolotl"), "__version__", "?")
+try:
+    import flash_attn; fa = flash_attn.__version__
+except Exception as e:
+    fa = f"(unavailable: {type(e).__name__})"
+print(f"STACK: torch {torch.__version__} | cuda {torch.version.cuda} | transformers "
+      f"{transformers.__version__} | axolotl {ax} | flash_attn {fa}")
+PY
+
+%runscript
+    exec "$@"
+
+%labels
+    Purpose    ie-extraction-lora-sft
+    Base       axolotlai/axolotl:main-20260817-py3.12-cu130-2.11.0
+    MN5Driver  595.71.05-supports-cuda-ge-13.0

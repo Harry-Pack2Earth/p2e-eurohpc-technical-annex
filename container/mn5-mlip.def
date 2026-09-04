@@ -1,0 +1,91 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:24.10-py3
+
+# container/mn5-mlip.def
+#
+# Singularity definition for the Phase-8 / 8a MLIP EMBEDDING image — deliberately
+# DISTINCT from container/mn5.def (the proven Phase-7 training image), so the
+# moving MLIP/ALCHEMI stack (orb-models, nvalchemi v0.1.0) can never destabilise
+# training. Same NGC PyTorch base (torch + CUDA + cuDNN pre-matched to the host
+# driver), plus the MLIP relax/embed stack.
+#
+# IMPORTANT — build this LOCALLY, not on MN5 (no outbound internet + no sudo on
+# MN5 compute/login nodes). Build on a machine with Singularity + fakeroot/sudo
+# (or the Sylabs Cloud remote builder — container/build_local.sh), then rsync the
+# .sif into /gpfs/projects/ehpc838 with scripts/mn5/sync_push.sh.
+#
+# Pretrained Orb weights are NOT baked into the image — they are staged to GPFS
+# separately (no node internet) and pointed at via --weights-dir / ORB_MODELS_CACHE_DIR
+# at run time (see slurm/mlip_embed_gpu.sbatch). Pin every version; do NOT float
+# :latest — the orb-models / nvalchemi APIs move, and a frozen .sif is what makes a
+# mid-run library bump impossible.
+
+%labels
+    Application p2e-formulations-modelling-mlip
+    Maintainer  pack2earth
+    Description Phase-8 8a MLIP embedding image (Orb relax + embed) for MN5 (BSC ehpc838)
+
+%help
+    MLIP embedding container for p2e-formulations-modelling Phase-8 8a.
+    Build locally: container/build_local.sh --def container/mn5-mlip.def --out container/p2e-mlip.sif
+    Push to MN5:   scripts/mn5/sync_push.sh --container
+    Run on MN5:    singularity exec --nv p2e-mlip.sif python scripts/build_mlip_embeddings.py \
+                     --geometries var/mlip/geometries --weights-dir <staged-orb-weights>
+
+%files
+    pyproject.toml /opt/p2e/pyproject.toml
+    README.md /opt/p2e/README.md
+    AGENTS.md /opt/p2e/AGENTS.md
+    src /opt/p2e/src
+    scripts/build_geometries.py /opt/p2e/scripts/build_geometries.py
+    scripts/build_mlip_embeddings.py /opt/p2e/scripts/build_mlip_embeddings.py
+
+%post
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+    apt-get update
+    apt-get install -y --no-install-recommends build-essential cmake git ninja-build
+    rm -rf /var/lib/apt/lists/*
+
+    python -m pip install --no-cache-dir --upgrade pip
+
+    # The two MLIP scripts (build_geometries.py / build_mlip_embeddings.py) are STANDALONE — they import only
+    # stdlib + numpy + lazy rdkit/ase/orb/sklearn, never the p2e package. So we do NOT `pip install .[modelling]`
+    # here: the NGC base ships Python 3.10 while pyproject pins requires-python>=3.11, and installing the
+    # package would abort the build for a dependency the scripts don't use. Install the runtime libs directly
+    # instead. torch is NOT reinstalled (it ships in the NGC base, matched to its CUDA — a second PyPI torch
+    # would silently shadow it; same trap called out in container/mn5.def).
+    python -m pip install --no-cache-dir "numpy==1.26.4" "scikit-learn==1.5.2"
+
+    # MLIP relax/embed stack. PIN these — the orb-models / nvalchemi APIs move.
+    # nvalchemi is a THROUGHPUT optimiser, not a correctness dependency for the
+    # 69-structure single-batch relax (orb-models' own batching suffices); it is
+    # installed for the gated 8c MD work and pinned so it can never churn mid-run.
+    # Adjust the pins to the versions verified on the first acc_debug smoke run.
+    python -m pip install --no-cache-dir \
+        "ase==3.23.0" \
+        "rdkit==2024.3.5"
+    python -m pip install --no-cache-dir \
+        "pynanoflann @ git+https://github.com/dwastberg/pynanoflann@af434039ae14bedcbb838a7808924d6689274168"
+    python -m pip install --no-cache-dir "cached_path==1.8.10"
+    python -m pip install --no-cache-dir --no-deps "orb-models==0.4.2"
+    # nvalchemi (optional, gated 8c) — uncomment + pin once the version is fixed:
+    #   python -m pip install --no-cache-dir "nvalchemi-toolkit==0.1.0" "nvalchemi-toolkit-ops==0.1.0"
+
+    # Build-time import sanity (no GPU during `build`, so imports only).
+    python -c "import ase, rdkit, numpy, sklearn; print('mlip stack imports OK')"
+    python -c "import orb_models; print('orb-models', getattr(orb_models,'__version__','?'))"
+    python -c "from orb_models.forcefield import pretrained; print('orb forcefield imports OK')"
+    python -c "import torch; print('torch', torch.__version__, 'cuda build', torch.version.cuda)"
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
+    export DO_NOT_TRACK=1
+    # ORB_MODELS_CACHE_DIR / XDG_CACHE_HOME / PYTORCH_CUDA_ALLOC_CONF are set by the
+    # sbatch at run time (weights staged to GPFS; caches off $HOME), not baked in.
+
+%runscript
+    exec "$@"

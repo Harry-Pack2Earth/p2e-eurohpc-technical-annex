@@ -1,0 +1,42 @@
+Bootstrap: docker
+From: docker.io/vllm/vllm-openai:v0.18.0
+
+# =============================================================================
+# vLLM inference/serving image for the v2 materials-IE model (Qwen3.5-27B, merged).
+#
+# The PROPER inference engine (W6 production + eval acceleration): tensor-parallel
+# + paged attention + native Qwen3.5 GatedDeltaNet kernels. Replaces the HF
+# device_map="auto" pipeline-parallel path (one GPU idle at a time, OOM past
+# batch 16, ~2 h for the gold set) used only to get the first number.
+#
+# PIN: vLLM 0.18.0 documents Qwen3.5-27B support (docs.vllm.ai ascend v0.18.0;
+# 0.17+ general support per the vLLM blog + Spheron 2026 guide). VERIFY the pinned
+# tag still lists Qwen3.5 before building (a 5-min check that avoids a wasted build,
+# the lesson from the ie-train SIF marathon).
+# CUDA: the vllm-openai image is cu12x; MN5's driver 595 / CUDA 13.2 is
+# backward-compatible, so it runs there (same reasoning that let cu130 ie-train run).
+#
+# Build LOCALLY (amd64), never on MN5 (no sudo / no outbound internet):
+#   bash container/build_local.sh --docker \
+#        --def container/ie-vllm.def --out container/ie-vllm.sif
+# Push with: scripts/mn5/sync_push.sh --container  (NB: pushes the .sif; --code does NOT).
+# =============================================================================
+
+%post
+    # MN5 runs the container as a non-root user (uid 54409). Make the interpreter +
+    # site-packages world-readable, same fix as ie-train.def, or python exec is denied.
+    chmod -R a+rX /usr/local /opt 2>/dev/null || true
+
+%environment
+    # Offline + no telemetry: MN5 compute nodes have no outbound internet; the merged
+    # model is staged on /gpfs. Force every hub client offline so a resolve can't hang.
+    export VLLM_DO_NOT_TRACK=1
+    export DO_NOT_TRACK=1
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
+    export TOKENIZERS_PARALLELISM=false
+
+%labels
+    role  p2e-materials-ie-vllm
+    base  vllm/vllm-openai:v0.18.0
+    note  serves the MERGED Qwen3.5-27B v2 checkpoint; TP=2 on a 2xH100 node

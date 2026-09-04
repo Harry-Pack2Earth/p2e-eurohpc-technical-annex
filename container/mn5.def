@@ -1,0 +1,103 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:25.01-py3
+# NB: base bumped 24.10 -> 25.01 because 24.10 ships Python 3.10 and this repo's package requires >=3.11
+# (pip install .[modelling] aborts with "requires a different Python: 3.10.12 not in '>=3.11'"). 25.01 ships
+# Python 3.12 (matches MN5's python/3.12.1) + CUDA 12.6; --nv only needs a new-enough host driver.
+
+# container/mn5.def
+#
+# Singularity definition for the p2e-formulations-modelling training image.
+#
+# IMPORTANT — build this LOCALLY, not on MN5.
+# MN5 login/compute nodes have no outbound internet, and `singularity build`
+# from a .def needs privileges you don't have there (no sudo on MN5). Build
+# the .sif on your laptop or any machine with Singularity + fakeroot/sudo (or
+# via the Sylabs Cloud remote builder — see container/build_local.sh), then
+# `rsync` the resulting .sif into /gpfs/projects/ehpc838 with
+# scripts/mn5/sync_push.sh --container.
+#
+# Base image: NVIDIA NGC PyTorch. It ships a CUDA toolkit + cuDNN + PyTorch
+# build already matched to each other, so `singularity exec --nv` only needs
+# the HOST driver to be new enough — this sidesteps the "is there a curated
+# torch/CUDA module on MN5" question entirely (see docs/mn5-workflow.md's
+# live-check list). Pin the tag; don't float `:latest`. Bump the date-coded
+# tag deliberately and re-verify `torch.cuda.is_available()` after container
+# updates (silent regressions from base-image bumps are a known HPC trap).
+#
+# Installs the repo's own [modelling]+[training]+[boost] extras (numpy,
+# scikit-learn, pandas, mlflow, optuna, shap, joblib, lightgbm, xgboost —
+# confirmed present in pyproject.toml). Deliberately does NOT install the
+# [torch] extra: torch already ships in this NGC base image, matched to its
+# bundled CUDA/cuDNN; pip-installing a second, PyPI-generic torch wheel on
+# top risks silently shadowing the NGC-optimized build (same class of trap as
+# the flash-attention-silently-falls-back-to-sdpa case in hpc-dl-perf's
+# anti-patterns reference).
+
+%labels
+    Application p2e-formulations-modelling
+    Maintainer  pack2earth
+    Description Training image for Phase-6 bake-off / tuning / NN backbone / kinetic track on MN5 (BSC ehpc838)
+
+%help
+    Training container for p2e-formulations-modelling on MN5.
+    Build locally: container/build_local.sh
+    Push to MN5:   scripts/mn5/sync_push.sh --container
+    Run on MN5:    singularity exec --nv p2e-formulations.sif p2e-formulations train ...
+    GPU jobs:      singularity exec --nv p2e-formulations.sif p2e-formulations train backbone --family <F> --epochs 300 ...
+                   singularity exec --nv p2e-formulations.sif p2e-formulations train kinetic <F> --label rate_k_per_day ...
+
+# %files paths are relative to the directory `singularity build` is invoked
+# from — container/build_local.sh cd's to the repo root first, so these are
+# repo-root-relative.
+%files
+    pyproject.toml /opt/p2e/pyproject.toml
+    src /opt/p2e/src
+    config /opt/p2e/config
+    README.md /opt/p2e/README.md
+    AGENTS.md /opt/p2e/AGENTS.md
+
+%post
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
+    # The NGC base image bakes pypi.ngc.nvidia.com as an extra index; that hostname is DEAD upstream
+    # (NXDOMAIN even via 1.1.1.1, 2026-08-31 — NVIDIA moved to pypi.nvidia.com). Every install was
+    # paying 5-retry timeout storms per package against it, and two builds died inside them. Point the
+    # extra index at the live host; packages themselves come from PyPI as before.
+    export PIP_EXTRA_INDEX_URL=https://pypi.nvidia.com
+
+    python -m pip install --no-cache-dir --upgrade pip
+
+    cd /opt/p2e
+    # NOTE: requires pyproject.toml's [training] and [boost] extras to exist
+    # (mlflow/optuna/shap/joblib/lightgbm and xgboost respectively). Confirmed
+    # present as of the W0 dependency-policy build; if this fails with an
+    # "extra does not exist" error, pyproject.toml has drifted from that.
+    # Pin numpy to EXACTLY the NGC base's version so the deps install never swaps it. Reinstalling/upgrading
+    # numpy over the one torch was compiled against breaks torch's C bridge — the observed failure was
+    # "RuntimeError: Numpy is not available" at torch.from_numpy in the backbone (numpy arrays themselves
+    # worked fine; only the torch<->numpy boundary broke). Our pyproject needs numpy>=2.0 and the base ships
+    # numpy 2.x, so pinning the base version satisfies both.
+    BASE_NUMPY="$(python -c 'import numpy; print(numpy.__version__)')"
+    echo "numpy==${BASE_NUMPY}" > /tmp/numpy-constraint.txt
+    echo "[setup] pinning numpy==${BASE_NUMPY} (NGC base, matched to torch) for the deps install"
+    python -m pip install --no-cache-dir -c /tmp/numpy-constraint.txt ".[modelling,training,boost]"
+
+    # Sanity-check the install at build time (no GPU present during `build`,
+    # so this only checks imports + the CUDA build tag, not device access).
+    # NON-FATAL: when building the linux/amd64 image on an Apple-ARM host (colima/Rosetta), x86_64 numeric
+    # libs (numpy/xgboost AVX) SIGILL at import under emulation — an emulation artifact, NOT a broken image.
+    # The image runs fine on MN5 (native x86_64); real verification is `torch.cuda.is_available()` there.
+    python -c "import p2e_formulations_pipeline; import sklearn, pandas, numpy, mlflow, optuna, shap, joblib, lightgbm, xgboost; print('p2e training stack OK')" || echo "WARN: import verify skipped (x86_64 emulation on ARM build host) — verify natively on MN5"
+    python -c "import torch; print('torch', torch.__version__, 'cuda build', torch.version.cuda)" || echo "WARN: torch verify skipped (emulated build host) — verify on MN5 GPU node"
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
+    export DO_NOT_TRACK=1
+    export MLFLOW_DISABLE_ENV_CREATION=true
+    # Set by the sbatch scripts at run time, not baked in: XDG_CACHE_HOME,
+    # TRITON_CACHE_DIR, PYTORCH_CUDA_ALLOC_CONF, SRUN_CPUS_PER_TASK.
+
+%runscript
+    exec p2e-formulations "$@"
