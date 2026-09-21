@@ -1,10 +1,13 @@
 #!/bin/bash
 # slurm/ie_sft.sbatch
 # =============================================================================
-# W3 — v2 IN-HOUSE EXTRACTION MODEL fine-tune (materials-IE), single-node 4xH100.
+# W3 — IN-HOUSE EXTRACTION MODEL fine-tune (materials-IE), single-node 4xH100.
 #
-# Reproduces Raul's recovered v1 recipe (bf16 LoRA r32/a64, lr1e-4, 2ep, seq8192,
-# seed17) via axolotl + DeepSpeed ZeRO-3 + Apptainer, on OUR ehpc838 allocation.
+# Runs the v3 QLoRA recipe from config/ie_sft.yaml (4-bit NF4 frozen base + bf16 LoRA
+# r64/a128, lr1e-4 cosine, 4ep, seq10240, seed17) via axolotl + DeepSpeed ZeRO-2 +
+# Apptainer, on OUR ehpc838 allocation. Effective batch is held at 32 on any GPU count
+# (grad_accum is derived below). The v1 recipe it grew from was bf16 LoRA r32/a64,
+# 2ep, seq8192 on ZeRO-3, and took 13.1 h on this shape.
 # This is the proven course stack (aif-dl-optimization-parallelization-training
 # hands-on-m5) adapted to this repo's SLURM conventions (see slurm/nn_gpu.sbatch).
 #
@@ -193,12 +196,10 @@ sed -i "s/^gradient_accumulation_steps:.*/gradient_accumulation_steps: ${GRAD_AC
 echo "EffBatch:     ${TARGET_EFF_BATCH} = micro ${MICRO_BATCH} x grad_accum ${GRAD_ACCUM} x gpus ${GPUS_PER_NODE}"
 
 # ==============================================================================
-# Materialise the DeepSpeed ZeRO-3 config into the isolated scratch dir (kept out
+# Materialise the DeepSpeed ZeRO-2 config into the isolated scratch dir (kept out
 # of the repo so only the 5 named W3 files are checked in).
 #
-# WHY ZeRO-3 (not ZeRO-2): the base is FROZEN (LoRA), so only the ~54 GB bf16 PARAM
-# tensor matters for memory — optimiser/grad state exists only for the tiny LoRA
-# MEASURED (smoke OOM, 54 GB/GPU): a FROZEN base is NOT sharded by ZeRO — ZeRO only partitions
+# WHY ZeRO-2 (not ZeRO-3), MEASURED (smoke OOM, 54 GB/GPU): a FROZEN base is NOT sharded by ZeRO — ZeRO only partitions
 # TRAINABLE params, so both ZeRO-2 AND ZeRO-3 REPLICATE the full base on every GPU. bf16 base =
 # 54 GB/GPU → OOM on 64 GB cards. FIX = QLoRA (config: load_in_4bit) → 4-bit base ~14 GB/GPU,
 # fits with headroom. With a 14 GB base params don't need sharding, so ZeRO-2 (shard the tiny

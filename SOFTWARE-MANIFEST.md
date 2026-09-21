@@ -87,5 +87,5 @@ Applied consistently across jobs:
 ## Languages and tooling
 
 Python, SQL, Bash, SLURM. Experiment tracking with MLflow. Optuna for
-hyperparameter search. DeepSpeed ZeRO-3 and axolotl for the language-model
+hyperparameter search. DeepSpeed ZeRO-2 and axolotl for the language-model
 fine-tune. BoTorch for multi-objective optimisation (CPU).
